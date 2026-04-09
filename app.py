@@ -126,10 +126,20 @@ def extract_text_from_upload(uploaded_file):
             return "", "Install pillow and pytesseract for image OCR, or upload PDF/text."
         try:
             image = Image.open(io.BytesIO(data))
+            # Light preprocessing improves OCR quality for timetable photos.
+            image = image.convert("L")
             text = pytesseract.image_to_string(image)
+            if not (text or "").strip():
+                return "", "No readable text found in image. Try a higher-contrast image or use PDF."
             return text.strip(), None
-        except Exception:
-            return "", "Image OCR failed. Upload a clearer file or edit schedule manually."
+        except Exception as e:
+            error_text = str(e).lower()
+            if "tesseract is not installed" in error_text or "tesseractnotfounderror" in error_text:
+                return "", (
+                    "Image OCR is unavailable on this deployment because the Tesseract engine is missing. "
+                    "Use PDF/TXT upload, or install Tesseract system package on the host."
+                )
+            return "", "Image OCR failed. Upload a clearer image/PDF or edit schedule manually."
 
     if name.endswith(".txt"):
         return data.decode("utf-8", errors="ignore"), None
@@ -488,4 +498,5 @@ with tab3:
                     st.rerun()
 
             st.divider()
+
 
