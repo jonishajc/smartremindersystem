@@ -26,9 +26,30 @@ except Exception:  # pragma: no cover
 
 
 # -------------------- ML priority model --------------------
-CATEGORIES = {"assignment": 0, "work": 1, "event": 2, "other": 3}
-X = [[2, 0], [6, 0], [12, 0], [48, 1], [72, 1], [2, 2], [80, 2], [3, 3], [100, 3]]
-y = [1, 1, 1, 0, 0, 1, 0, 1, 0]
+CATEGORIES = {
+    "academics": 0,
+    "work": 1,
+    "personal": 2,
+    "entertainment": 3,
+    "shopping": 4,
+    "other": 5,
+}
+X = [
+    [2, 0], [8, 0], [24, 0],       # academics
+    [2, 1], [10, 1], [48, 1],      # work
+    [1, 2], [6, 2], [72, 2],       # personal
+    [1, 3], [12, 3], [80, 3],      # entertainment
+    [2, 4], [24, 4], [96, 4],      # shopping
+    [4, 5], [30, 5], [120, 5],     # other
+]
+y = [
+    1, 1, 0,
+    1, 1, 0,
+    1, 1, 0,
+    1, 0, 0,
+    1, 0, 0,
+    1, 0, 0,
+]
 
 clf = DecisionTreeClassifier(max_depth=3)
 clf.fit(X, y)
@@ -38,8 +59,34 @@ def predict_priority(due_date, category):
     if not due_date:
         return "Optional"
     hours = (due_date - datetime.now()).total_seconds() / 3600
-    cat_id = CATEGORIES.get(category, 3)
+    cat_id = CATEGORIES.get(category, CATEGORIES["other"])
     return "Critical" if clf.predict([[hours, cat_id]])[0] == 1 else "Optional"
+
+
+def has_explicit_time(text: str):
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b|\bnoon\b|\bmidnight\b",
+            text.lower(),
+        )
+    )
+
+
+def infer_category(task_text: str, matched_subject: str = ""):
+    text = f"{task_text or ''} {matched_subject or ''}".lower()
+    rules = {
+        "academics": ["assignment", "homework", "exam", "class", "lecture", "study", "lab", "de", "python"],
+        "work": ["meeting", "office", "client", "project", "deadline", "report", "call"],
+        "shopping": ["buy", "purchase", "order", "grocery", "shop", "milk", "medicine"],
+        "entertainment": ["movie", "game", "netflix", "series", "concert", "party"],
+        "personal": ["gym", "doctor", "family", "friend", "birthday", "bank", "bill"],
+    }
+    for category, keys in rules.items():
+        if any(k in text for k in keys):
+            return category
+    return "other"
 
 
 # -------------------- Date extraction --------------------
@@ -282,6 +329,17 @@ def canonical_subject_label(text: str):
     return cleaned
 
 
+def slot_datetime_for_target(base_date: datetime, slot_day: str, start_time: str):
+    if not base_date or not slot_day or not start_time:
+        return None
+    if slot_day not in WEEKDAYS:
+        return None
+    if base_date.strftime("%A") != slot_day:
+        return None
+    hh, mm = [int(x) for x in start_time.split(":")]
+    return base_date.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
 # -------------------- Database --------------------
 conn = sqlite3.connect("reminders.db", check_same_thread=False)
 cur = conn.cursor()
@@ -375,11 +433,11 @@ if "subject_aliases" not in st.session_state:
 if "period_time_map" not in st.session_state:
     st.session_state.period_time_map = {}
 
-tab0, tab1, tab2, tab3 = st.tabs(["Timetable", "Add", "View", "Manage"])
+tab0, tab1, tab2, tab3 = st.tabs(["Add", "Timetable", "View", "Manage"])
 
 
-# -------------------- Tab 0: Timetable --------------------
-with tab0:
+# -------------------- Tab 1: Timetable --------------------
+with tab1:
     st.markdown("#### Upload timetable")
     up = st.file_uploader(
         "Upload PDF/Image/TXT timetable",
@@ -429,8 +487,8 @@ with tab0:
         st.caption(f"Active timetable rows: {len(st.session_state.timetable_rows)}")
 
 
-# -------------------- Tab 1: Add --------------------
-with tab1:
+# -------------------- Tab 0: Add --------------------
+with tab0:
     st.markdown("#### New reminder")
     text = st.text_input(
         "Describe your task",
@@ -449,6 +507,7 @@ with tab1:
     matched_subject = None
     matched_label = None
     matched_period = None
+    chosen = None
 
     normalized_text = canonical_subject_label(text)
     for alias, canonical in st.session_state.subject_aliases.items():
@@ -456,7 +515,13 @@ with tab1:
             normalized_text = normalized_text.replace(alias, canonical)
 
     possible_slots = find_matching_slots(normalized_text, st.session_state.timetable_rows)
-    if text and not auto_date and possible_slots:
+    if auto_date and possible_slots:
+        weekday_name = auto_date.strftime("%A")
+        weekday_slots = [s for s in possible_slots if str(s.get("day", "")).strip() == weekday_name]
+        if weekday_slots:
+            possible_slots = weekday_slots
+
+    if text and possible_slots:
         labels = [
             f"{r.get('subject', 'Unknown')} | {r.get('day', '')} {r.get('start_time', '')}"
             for r in possible_slots
@@ -471,13 +536,16 @@ with tab1:
         start_time = str(chosen.get("start_time", "")).strip()
         if not start_time and matched_period and matched_period in st.session_state.period_time_map:
             start_time = st.session_state.period_time_map[matched_period]
-        matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), start_time)
+        if auto_date and not has_explicit_time(text):
+            matched_slot_dt = slot_datetime_for_target(auto_date, chosen.get("day", ""), start_time)
+        if not matched_slot_dt:
+            matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), start_time)
         matched_label = selected_label
         if matched_slot_dt:
             st.success(f"Class slot selected: *{matched_slot_dt.strftime('%a %b %d, %Y - %H:%M')}*")
         elif matched_period:
             st.info(f"I found subject/day but no exact hour for `{matched_period}`. Set a period time below.")
-    elif text and not auto_date and st.session_state.timetable_rows:
+    elif text and st.session_state.timetable_rows:
         st.info("No subject match found in timetable. Pick manual date/time below.")
 
     if matched_period and not matched_slot_dt:
@@ -529,7 +597,14 @@ with tab1:
             value=datetime.now().replace(second=0, microsecond=0).time(),
         )
     with col2:
-        category = st.selectbox("Category", ["assignment", "work", "event", "other"])
+        suggested_category = infer_category(task if task else text, matched_subject or "")
+        category_options = ["academics", "work", "personal", "entertainment", "shopping", "other"]
+        category = st.selectbox(
+            "Category",
+            category_options,
+            index=category_options.index(suggested_category),
+            help=f"AI suggested: {suggested_category}",
+        )
         priority_mode = st.radio("Priority", ["AI decides", "I'll choose"])
 
     remind_offset = st.selectbox(
@@ -542,7 +617,7 @@ with tab1:
     if priority_mode == "I'll choose":
         priority = st.selectbox("Set priority", ["Critical", "Optional"])
     else:
-        chosen_dt = auto_date or matched_slot_dt or datetime.combine(manual_date, manual_time)
+        chosen_dt = matched_slot_dt or auto_date or datetime.combine(manual_date, manual_time)
         priority = predict_priority(chosen_dt, category)
         badge = "🔴 Critical" if priority == "Critical" else "🟢 Optional"
         st.markdown(f"AI priority: *{badge}*")
@@ -551,9 +626,9 @@ with tab1:
         if not text.strip():
             st.warning("Please enter a task.")
         else:
-            final_dt = auto_date or matched_slot_dt or datetime.combine(manual_date, manual_time)
+            final_dt = matched_slot_dt or auto_date or datetime.combine(manual_date, manual_time)
             final_task = task if task else text
-            final_subject = matched_subject
+            final_subject = matched_subject or (chosen.get("subject") if chosen else None)
             remind_at = final_dt - timedelta(minutes=int(remind_offset)) if final_dt else None
             add_reminder(final_task, final_dt, category, priority, final_subject, remind_at)
             if matched_label:
@@ -620,4 +695,5 @@ with tab3:
                     st.rerun()
 
             st.divider()
+
 
