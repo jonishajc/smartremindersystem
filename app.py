@@ -1,13 +1,28 @@
+import io
 import re
 import sqlite3
-import base64
-import json
 from datetime import datetime, timedelta
 
 import dateparser
 from dateparser.search import search_dates
+import pandas as pd
 import streamlit as st
 from sklearn.tree import DecisionTreeClassifier
+
+try:
+    import pdfplumber
+except Exception:  # pragma: no cover
+    pdfplumber = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover
+    pytesseract = None
 
 
 # -------------------- ML priority model --------------------
@@ -27,13 +42,8 @@ def predict_priority(due_date, category):
     return "Critical" if clf.predict([[hours, cat_id]])[0] == 1 else "Optional"
 
 
-# -------------------- Date extraction (FIXED) --------------------
+# -------------------- Date extraction --------------------
 def extract_reminder(text: str):
-    """
-    Returns (task_text, due_datetime_or_None).
-    FIX: dateparser is called with PREFER_DAY_OF_MONTH and explicit time
-    handling so '6 pm' is never dropped.
-    """
     text = (text or "").strip()
     if not text:
         return "", None
@@ -42,7 +52,6 @@ def extract_reminder(text: str):
         "PREFER_DATES_FROM": "future",
         "RELATIVE_BASE": datetime.now(),
         "RETURN_AS_TIMEZONE_AWARE": False,
-        "PREFER_DAY_OF_MONTH": "first",
     }
 
     found = search_dates(text, settings=settings)
@@ -51,23 +60,7 @@ def extract_reminder(text: str):
         due = dateparser.parse(text, settings=settings)
         return text, due
 
-    # Use the longest matched date phrase so "tomorrow 6 pm" beats "tomorrow"
     date_text, due = max(found, key=lambda x: len(x[0]))
-
-    # --- TIME FIX ---
-    # If the matched phrase didn't include an explicit time but a time token
-    # exists elsewhere in the original text, re-parse the full text.
-    time_pattern = re.compile(
-        r'\b(\d{1,2}(:\d{2})?\s*(am|pm)|'
-        r'\d{1,2}(:\d{2})?\s*(AM|PM)|'
-        r'midnight|noon|evening|morning|afternoon)\b',
-        re.IGNORECASE,
-    )
-    if time_pattern.search(text) and not time_pattern.search(date_text):
-        full_parse = dateparser.parse(text, settings=settings)
-        if full_parse:
-            due = full_parse
-
     task = re.sub(re.escape(date_text), "", text, flags=re.IGNORECASE).strip(" ,.-")
     if not task:
         task = text
@@ -75,151 +68,145 @@ def extract_reminder(text: str):
     return task, due
 
 
-# -------------------- Timetable helpers --------------------
-DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+# -------------------- Timetable parsing helpers --------------------
+DAY_ALIASES = {
+    "mon": "Monday",
+    "monday": "Monday",
+    "tue": "Tuesday",
+    "tues": "Tuesday",
+    "tuesday": "Tuesday",
+    "wed": "Wednesday",
+    "wednesday": "Wednesday",
+    "thu": "Thursday",
+    "thurs": "Thursday",
+    "thursday": "Thursday",
+    "fri": "Friday",
+    "friday": "Friday",
+    "sat": "Saturday",
+    "saturday": "Saturday",
+    "sun": "Sunday",
+    "sunday": "Sunday",
+}
 
 
-def parse_timetable_text(raw: str) -> list[dict]:
-    """
-    Parse a free-text timetable into structured slots.
-    Each slot: {day, subject, start_time, end_time}
-    Supports formats like:
-      Monday 9:00-10:00 Python
-      Tue 14:00 Math (1hr)
-      Wednesday: Physics 11am-12pm
-    """
-    slots = []
-    lines = raw.strip().splitlines()
+def normalize_day(day_text: str):
+    if not day_text:
+        return None
+    key = day_text.strip().lower()
+    return DAY_ALIASES.get(key)
 
-    time_range_re = re.compile(
-        r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*[-–to]+\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)',
-        re.IGNORECASE,
+
+def parse_time_text(time_text: str):
+    if not time_text:
+        return None
+    cleaned = time_text.strip().lower().replace(".", ":")
+    if re.fullmatch(r"\d{1,2}", cleaned):
+        cleaned += ":00"
+    parsed = dateparser.parse(cleaned)
+    if not parsed:
+        return None
+    return parsed.strftime("%H:%M")
+
+
+def extract_text_from_upload(uploaded_file):
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+
+    if name.endswith(".pdf"):
+        if pdfplumber is None:
+            return "", "Install pdfplumber to parse PDF timetables."
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                text_parts.append(page.extract_text() or "")
+        return "\n".join(text_parts).strip(), None
+
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        if Image is None or pytesseract is None:
+            return "", "Install pillow and pytesseract for image OCR, or upload PDF/text."
+        try:
+            image = Image.open(io.BytesIO(data))
+            text = pytesseract.image_to_string(image)
+            return text.strip(), None
+        except Exception:
+            return "", "Image OCR failed. Upload a clearer file or edit schedule manually."
+
+    if name.endswith(".txt"):
+        return data.decode("utf-8", errors="ignore"), None
+
+    return "", "Unsupported file type. Use PDF, image, or TXT."
+
+
+def parse_timetable_text(raw_text: str):
+    lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+    entries = []
+    if not lines:
+        return entries
+
+    pattern = re.compile(
+        r"(?P<day>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+        r"[\s,:-]+(?P<subject>[A-Za-z][A-Za-z0-9 &/\-]{1,40})"
+        r"[\s,:-]+(?P<start>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)"
+        r"\s*(?:-|to|–|—)\s*"
+        r"(?P<end>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        flags=re.IGNORECASE,
     )
-    single_time_re = re.compile(
-        r'(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))',
-        re.IGNORECASE,
-    )
-    duration_re = re.compile(r'\((\d+(?:\.\d+)?)\s*hr?s?\)', re.IGNORECASE)
-
-    day_aliases = {
-        "mon": "Monday", "tue": "Tuesday", "wed": "Wednesday",
-        "thu": "Thursday", "fri": "Friday", "sat": "Saturday", "sun": "Sunday",
-    }
 
     for line in lines:
-        line = line.strip()
-        if not line:
+        match = pattern.search(line)
+        if not match:
             continue
+        day = normalize_day(match.group("day"))
+        subject = match.group("subject").strip()
+        start_time = parse_time_text(match.group("start"))
+        end_time = parse_time_text(match.group("end"))
+        if day and subject and start_time:
+            entries.append(
+                {
+                    "day": day,
+                    "subject": subject,
+                    "start_time": start_time,
+                    "end_time": end_time or "",
+                }
+            )
 
-        day = None
-        for d in DAYS:
-            if d.lower() in line.lower():
-                day = d
-                break
-        if not day:
-            for alias, full in day_aliases.items():
-                if re.search(r'\b' + alias + r'\b', line, re.IGNORECASE):
-                    day = full
-                    break
-        if not day:
-            continue
-
-        start_dt = end_dt = None
-        range_match = time_range_re.search(line)
-        if range_match:
-            start_dt = dateparser.parse(range_match.group(1))
-            end_dt = dateparser.parse(range_match.group(2))
-        else:
-            single = single_time_re.search(line)
-            if single:
-                start_dt = dateparser.parse(single.group(1))
-                dur = duration_re.search(line)
-                if dur and start_dt:
-                    end_dt = start_dt + timedelta(hours=float(dur.group(1)))
-                elif start_dt:
-                    end_dt = start_dt + timedelta(hours=1)
-
-        if not start_dt:
-            continue
-
-        # Strip day + time tokens to get subject name
-        subject = line
-        subject = re.sub(r'\b' + day[:3] + r'\w*\b', '', subject, flags=re.IGNORECASE)
-        for d in DAYS:
-            subject = re.sub(r'\b' + d + r'\b', '', subject, flags=re.IGNORECASE)
-        if range_match:
-            subject = subject.replace(range_match.group(0), '')
-        elif single_time_re.search(subject):
-            subject = single_time_re.sub('', subject)
-        subject = duration_re.sub('', subject)
-        subject = re.sub(r'[:\-–|]', ' ', subject).strip()
-        subject = re.sub(r'\s+', ' ', subject).strip()
-        if not subject:
-            subject = "Class"
-
-        slots.append({
-            "day": day,
-            "subject": subject,
-            "start_time": start_dt.strftime("%H:%M"),
-            "end_time": end_dt.strftime("%H:%M") if end_dt else None,
-        })
-
-    return slots
+    return entries
 
 
-def find_matching_class(task_text: str, timetable: list[dict], target_date: datetime | None):
-    """
-    Given a task description and an optional target date, find the best
-    matching timetable slot.
-    Returns a slot dict or None.
-    """
-    if not timetable or not task_text:
+def next_weekday_datetime(day_name: str, time_str: str):
+    weekday_map = {
+        "Monday": 0,
+        "Tuesday": 1,
+        "Wednesday": 2,
+        "Thursday": 3,
+        "Friday": 4,
+        "Saturday": 5,
+        "Sunday": 6,
+    }
+    if day_name not in weekday_map or not time_str:
         return None
 
-    task_lower = task_text.lower()
-    candidates = []
-
-    target_day = None
-    if target_date:
-        target_day = DAYS[target_date.weekday()]
-
-    for slot in timetable:
-        score = 0
-        subj_lower = slot["subject"].lower()
-
-        # Keyword overlap
-        for word in re.findall(r'\w+', subj_lower):
-            if len(word) > 3 and word in task_lower:
-                score += 2
-
-        # Day match
-        if target_day and slot["day"].lower() == target_day.lower():
-            score += 3
-
-        if score > 0:
-            candidates.append((score, slot))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    now = datetime.now()
+    target_weekday = weekday_map[day_name]
+    hh, mm = [int(x) for x in time_str.split(":")]
+    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    delta_days = (target_weekday - now.weekday()) % 7
+    candidate = candidate + timedelta(days=delta_days)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
 
 
-def get_next_occurrence(slot: dict) -> datetime:
-    """Return the next datetime this slot occurs."""
-    today = datetime.now()
-    day_idx = DAYS.index(slot["day"])
-    current_day_idx = today.weekday()
-    days_ahead = (day_idx - current_day_idx) % 7
-    if days_ahead == 0:
-        # check if time already passed today
-        h, m = map(int, slot["start_time"].split(":"))
-        if today.hour > h or (today.hour == h and today.minute >= m):
-            days_ahead = 7
-    target_date = today + timedelta(days=days_ahead)
-    h, m = map(int, slot["start_time"].split(":"))
-    return target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+def find_matching_slots(task_text: str, timetable_rows):
+    words = re.findall(r"[a-zA-Z]{3,}", (task_text or "").lower())
+    if not words:
+        return []
+    matches = []
+    for row in timetable_rows:
+        subject = str(row.get("subject", "")).lower()
+        if any(w in subject for w in words):
+            matches.append(row)
+    return matches
 
 
 # -------------------- Database --------------------
@@ -234,7 +221,9 @@ cur.execute(
         due_date TEXT,
         category TEXT,
         priority TEXT,
-        done INTEGER DEFAULT 0
+        done INTEGER DEFAULT 0,
+        subject TEXT,
+        remind_at TEXT
     )
 """
 )
@@ -244,14 +233,19 @@ cur.execute("PRAGMA table_info(reminders)")
 cols = {row[1] for row in cur.fetchall()}
 if "done" not in cols:
     cur.execute("ALTER TABLE reminders ADD COLUMN done INTEGER DEFAULT 0")
-    conn.commit()
+if "subject" not in cols:
+    cur.execute("ALTER TABLE reminders ADD COLUMN subject TEXT")
+if "remind_at" not in cols:
+    cur.execute("ALTER TABLE reminders ADD COLUMN remind_at TEXT")
+conn.commit()
 
 
-def add_reminder(task, due_date, category, priority):
+def add_reminder(task, due_date, category, priority, subject=None, remind_at=None):
     due_str = due_date.strftime("%Y-%m-%d %H:%M") if due_date else None
+    remind_str = remind_at.strftime("%Y-%m-%d %H:%M") if remind_at else None
     cur.execute(
-        "INSERT INTO reminders (task,due_date,category,priority) VALUES (?,?,?,?)",
-        (task, due_str, category, priority),
+        "INSERT INTO reminders (task,due_date,category,priority,subject,remind_at) VALUES (?,?,?,?,?,?)",
+        (task, due_str, category, priority, subject, remind_str),
     )
     conn.commit()
 
@@ -268,304 +262,132 @@ def get_reminders():
     return cur.fetchall()
 
 
-# -------------------- Anthropic API helper --------------------
-def call_claude(prompt: str, system: str = "", image_b64: str = None, image_mime: str = "image/jpeg") -> str:
-    """Call Claude API. Optionally pass an image as base64."""
-    import urllib.request
-    import json as _json
-
-    messages_content = []
-    if image_b64:
-        messages_content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": image_mime, "data": image_b64},
-        })
-    messages_content.append({"type": "text", "text": prompt})
-
-    payload = _json.dumps({
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1000,
-        "system": system if system else "You are a helpful assistant.",
-        "messages": [{"role": "user", "content": messages_content}],
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req) as resp:
-        data = _json.loads(resp.read())
-    return data["content"][0]["text"]
-
-
-def parse_timetable_with_ai(raw_text: str = None, image_b64: str = None, image_mime: str = "image/jpeg") -> list[dict]:
-    """Use Claude to extract structured timetable from text or image."""
-    system = (
-        "You are a timetable parser. Extract class schedule from the input and return ONLY valid JSON. "
-        "Output a JSON array of objects, each with keys: day (full weekday name), subject (string), "
-        "start_time (HH:MM 24hr), end_time (HH:MM 24hr or null). "
-        "Example: [{\"day\": \"Monday\", \"subject\": \"Python Programming\", \"start_time\": \"09:00\", \"end_time\": \"10:00\"}]"
-        "Return ONLY the JSON array, no markdown, no explanation."
-    )
-    prompt = raw_text or "Extract the timetable from the image above."
-    try:
-        response = call_claude(prompt, system=system, image_b64=image_b64, image_mime=image_mime)
-        response = response.strip()
-        # Strip markdown fences if present
-        response = re.sub(r'^```json\s*', '', response)
-        response = re.sub(r'^```\s*', '', response)
-        response = re.sub(r'\s*```$', '', response)
-        return json.loads(response)
-    except Exception as e:
-        st.warning(f"AI timetable parsing failed: {e}. Trying rule-based parser...")
-        if raw_text:
-            return parse_timetable_text(raw_text)
-        return []
-
-
-# -------------------- Session state --------------------
-if "timetable" not in st.session_state:
-    st.session_state.timetable = []
-if "pending_reminder" not in st.session_state:
-    st.session_state.pending_reminder = None  # holds (task, due_dt, category, matched_slot)
-
-
 # -------------------- UI --------------------
 st.set_page_config(page_title="Smart Reminders", page_icon="🗓️", layout="centered")
 
 st.markdown(
     """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-    }
-
-    .block-container {
-        max-width: 740px;
-        padding-top: 1.5rem;
-    }
-
-    h1 {
-        font-family: 'Syne', sans-serif;
-        font-weight: 800;
-        letter-spacing: -1px;
-        font-size: 2rem;
-    }
-
+    .block-container { max-width: 900px; padding-top: 2rem; }
+    h1 { font-weight: 500; letter-spacing: -0.5px; }
     .reminder-card {
-        background: #fafaf8;
-        border: 1.5px solid #ebebе8;
-        border-radius: 14px;
+        background: #f9f9f7;
+        border: 1px solid #e8e8e4;
+        border-radius: 12px;
         padding: 14px 18px;
         margin-bottom: 10px;
-        transition: box-shadow 0.2s;
     }
-
-    .reminder-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.06); }
-
     .tag {
         display: inline-block;
         font-size: 11px;
-        padding: 2px 10px;
+        padding: 2px 9px;
         border-radius: 99px;
-        font-weight: 600;
+        font-weight: 500;
         margin-right: 6px;
-        letter-spacing: 0.3px;
     }
-
     .critical { background: #fde8e8; color: #991b1b; }
     .optional { background: #e8f4e8; color: #166534; }
-
-    .class-match-box {
-        background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%);
-        border: 1.5px solid #bfdbfe;
-        border-radius: 12px;
-        padding: 14px 18px;
-        margin: 10px 0;
-    }
-
-    .tt-slot {
-        background: #f5f3ff;
-        border: 1px solid #ddd6fe;
-        border-radius: 8px;
-        padding: 8px 14px;
-        margin-bottom: 6px;
-        font-size: 13.5px;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        font-family: 'Syne', sans-serif;
-        font-weight: 600;
-        font-size: 13px;
-    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 st.title("🗓️ Smart Reminder System")
-st.caption("NLP input · AI timetable parsing · Predictive priority")
+st.caption("Timetable-aware reminders · NLP input · Predictive priority")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Add", "View", "Manage", "Timetable"])
+if "timetable_rows" not in st.session_state:
+    st.session_state.timetable_rows = []
+
+tab0, tab1, tab2, tab3 = st.tabs(["Timetable", "Add", "View", "Manage"])
 
 
-# -------------------- Tab 4: Timetable --------------------
-with tab4:
-    st.markdown("#### Your Timetable")
-    st.markdown(
-        "Paste your class schedule as text **or** upload a photo. "
-        "Once saved, the reminder system will detect matching classes automatically."
+# -------------------- Tab 0: Timetable --------------------
+with tab0:
+    st.markdown("#### Upload timetable")
+    up = st.file_uploader(
+        "Upload PDF/Image/TXT timetable",
+        type=["pdf", "png", "jpg", "jpeg", "webp", "txt"],
     )
 
-    input_mode = st.radio("Input method", ["Text", "Image upload"], horizontal=True)
-
-    if input_mode == "Text":
-        sample = (
-            "Monday 9:00-10:00 Python Programming\n"
-            "Tuesday 11:00-12:30 Data Structures\n"
-            "Wednesday 14:00-15:00 Machine Learning\n"
-            "Friday 10:00-11:00 Math"
-        )
-        tt_text = st.text_area(
-            "Paste schedule here (one class per line)",
-            placeholder=sample,
-            height=180,
-        )
-        use_ai = st.checkbox("Use AI parser (more accurate for complex formats)", value=True)
-
-        if st.button("Parse & Save Timetable", use_container_width=True):
-            if tt_text.strip():
-                with st.spinner("Parsing timetable..."):
-                    if use_ai:
-                        slots = parse_timetable_with_ai(raw_text=tt_text)
-                    else:
-                        slots = parse_timetable_text(tt_text)
-
-                if slots:
-                    st.session_state.timetable = slots
-                    st.success(f"Saved {len(slots)} class slots!")
-                else:
-                    st.error("Couldn't parse any slots. Try a clearer format.")
+    if up:
+        raw_text, error = extract_text_from_upload(up)
+        if error:
+            st.warning(error)
+        if raw_text:
+            rows = parse_timetable_text(raw_text)
+            if rows:
+                st.success(f"Detected {len(rows)} timetable slot(s). Review and edit below.")
+                df = pd.DataFrame(rows)
+                edited = st.data_editor(
+                    df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key="tt_editor",
+                )
+                st.session_state.timetable_rows = edited.fillna("").to_dict("records")
             else:
-                st.warning("Please enter your schedule.")
+                st.info("Could not parse structured slots from text. Add rows manually below.")
+                st.text_area("Extracted text preview", value=raw_text[:3000], height=180)
 
-    else:
-        uploaded = st.file_uploader(
-            "Upload timetable image (photo, screenshot, PDF page)",
-            type=["jpg", "jpeg", "png", "webp"],
+    if not st.session_state.timetable_rows:
+        st.markdown("##### Add timetable rows manually")
+        empty_df = pd.DataFrame(
+            [
+                {"day": "Monday", "subject": "Python", "start_time": "15:00", "end_time": "16:00"},
+            ]
         )
-        if uploaded:
-            st.image(uploaded, caption="Uploaded timetable", use_container_width=True)
-            if st.button("Parse Timetable from Image", use_container_width=True):
-                with st.spinner("Sending to AI for analysis..."):
-                    raw_bytes = uploaded.read()
-                    b64 = base64.b64encode(raw_bytes).decode()
-                    mime = uploaded.type or "image/jpeg"
-                    slots = parse_timetable_with_ai(image_b64=b64, image_mime=mime)
-
-                if slots:
-                    st.session_state.timetable = slots
-                    st.success(f"Extracted {len(slots)} class slots from image!")
-                else:
-                    st.error("Couldn't extract schedule. Try a clearer image or use text input.")
-
-    if st.session_state.timetable:
-        st.markdown("---")
-        st.markdown(f"**{len(st.session_state.timetable)} slots loaded:**")
-        for slot in st.session_state.timetable:
-            end_str = f" – {slot['end_time']}" if slot.get("end_time") else ""
-            st.markdown(
-                f'<div class="tt-slot">📚 <strong>{slot["subject"]}</strong> · '
-                f'{slot["day"]} {slot["start_time"]}{end_str}</div>',
-                unsafe_allow_html=True,
-            )
-        if st.button("Clear timetable", type="secondary"):
-            st.session_state.timetable = []
+        manual_df = st.data_editor(
+            empty_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="tt_manual_editor",
+        )
+        if st.button("Save timetable rows", use_container_width=True):
+            st.session_state.timetable_rows = manual_df.fillna("").to_dict("records")
+            st.success("Timetable saved.")
             st.rerun()
+    else:
+        st.caption(f"Active timetable rows: {len(st.session_state.timetable_rows)}")
 
 
 # -------------------- Tab 1: Add --------------------
 with tab1:
     st.markdown("#### New reminder")
-
-    # --- Handle pending timetable-based reminder ---
-    if st.session_state.pending_reminder:
-        p = st.session_state.pending_reminder
-        task, base_dt, category, matched_slot = p
-
-        st.markdown(
-            f'<div class="class-match-box">'
-            f'📚 <strong>Class found:</strong> {matched_slot["subject"]} on '
-            f'{matched_slot["day"]} at {matched_slot["start_time"]}'
-            f'{"–" + matched_slot["end_time"] if matched_slot.get("end_time") else ""}'
-            f'<br><span style="color:#555;font-size:13px">When should I remind you?</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-        remind_offset = st.selectbox(
-            "Remind me…",
-            ["10 mins before", "30 mins before", "1 hour before", "2 hours before",
-             "At class time", "Custom time"],
-        )
-
-        class_dt = get_next_occurrence(matched_slot)
-
-        if remind_offset == "10 mins before":
-            final_reminder_dt = class_dt - timedelta(minutes=10)
-        elif remind_offset == "30 mins before":
-            final_reminder_dt = class_dt - timedelta(minutes=30)
-        elif remind_offset == "1 hour before":
-            final_reminder_dt = class_dt - timedelta(hours=1)
-        elif remind_offset == "2 hours before":
-            final_reminder_dt = class_dt - timedelta(hours=2)
-        elif remind_offset == "At class time":
-            final_reminder_dt = class_dt
-        else:
-            c1, c2 = st.columns(2)
-            with c1:
-                custom_d = st.date_input("Date", value=class_dt.date(), key="custom_d")
-            with c2:
-                custom_t = st.time_input("Time", value=class_dt.time(), key="custom_t")
-            final_reminder_dt = datetime.combine(custom_d, custom_t)
-
-        col_confirm, col_cancel = st.columns(2)
-        with col_confirm:
-            if st.button("✅ Confirm Reminder", use_container_width=True):
-                priority = predict_priority(final_reminder_dt, category)
-                add_reminder(task, final_reminder_dt, category, priority)
-                st.success(
-                    f"Reminder set for {final_reminder_dt.strftime('%b %d, %Y – %H:%M')}!"
-                )
-                st.session_state.pending_reminder = None
-                st.rerun()
-        with col_cancel:
-            if st.button("✖ Cancel", use_container_width=True):
-                st.session_state.pending_reminder = None
-                st.rerun()
-
-        st.stop()
-
-    # --- Normal add flow ---
     text = st.text_input(
         "Describe your task",
-        placeholder="e.g. submit lab report by friday 5pm  ·  python assignment tomorrow",
+        placeholder="e.g. python homework, submit by friday 5pm",
     )
 
     task, auto_date = "", None
     if text:
         task, auto_date = extract_reminder(text)
         if auto_date:
-            st.success(f"Detected: **{task}** · 📅 {auto_date.strftime('%b %d, %Y – %H:%M')}")
+            st.success(f"Detected date: *{auto_date.strftime('%b %d, %Y - %H:%M')}*")
         else:
-            st.info("No date detected – pick one below or use your timetable.")
+            st.info("No clear date in text. I'll try matching subject from your timetable.")
+
+    matched_slot_dt = None
+    matched_subject = None
+    matched_label = None
+
+    possible_slots = find_matching_slots(text, st.session_state.timetable_rows)
+    if text and not auto_date and possible_slots:
+        labels = [
+            f"{r.get('subject', 'Unknown')} | {r.get('day', '')} {r.get('start_time', '')}"
+            for r in possible_slots
+        ]
+        selected_label = st.selectbox(
+            "I found matching class timings. Pick one:",
+            labels,
+        )
+        chosen = possible_slots[labels.index(selected_label)]
+        matched_subject = chosen.get("subject")
+        matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), chosen.get("start_time", ""))
+        matched_label = selected_label
+        if matched_slot_dt:
+            st.success(f"Class slot selected: *{matched_slot_dt.strftime('%a %b %d, %Y - %H:%M')}*")
+    elif text and not auto_date and st.session_state.timetable_rows:
+        st.info("No subject match found in timetable. Pick manual date/time below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -578,11 +400,18 @@ with tab1:
         category = st.selectbox("Category", ["assignment", "work", "event", "other"])
         priority_mode = st.radio("Priority", ["AI decides", "I'll choose"])
 
+    remind_offset = st.selectbox(
+        "Remind me before class/task by",
+        [0, 5, 10, 15, 20, 30, 45, 60],
+        index=4,
+        format_func=lambda x: "At exact time" if x == 0 else f"{x} minutes",
+    )
+
     if priority_mode == "I'll choose":
         priority = st.selectbox("Set priority", ["Critical", "Optional"])
     else:
-        final_dt = auto_date if auto_date else datetime.combine(manual_date, manual_time)
-        priority = predict_priority(final_dt, category)
+        chosen_dt = auto_date or matched_slot_dt or datetime.combine(manual_date, manual_time)
+        priority = predict_priority(chosen_dt, category)
         badge = "🔴 Critical" if priority == "Critical" else "🟢 Optional"
         st.markdown(f"AI priority: *{badge}*")
 
@@ -590,19 +419,15 @@ with tab1:
         if not text.strip():
             st.warning("Please enter a task.")
         else:
-            final_dt = auto_date if auto_date else datetime.combine(manual_date, manual_time)
+            final_dt = auto_date or matched_slot_dt or datetime.combine(manual_date, manual_time)
             final_task = task if task else text
-
-            # --- Timetable matching ---
-            if st.session_state.timetable:
-                matched = find_matching_class(final_task, st.session_state.timetable, final_dt)
-                if matched:
-                    st.session_state.pending_reminder = (final_task, final_dt, category, matched)
-                    st.rerun()
-
-            # No timetable match → add directly
-            add_reminder(final_task, final_dt, category, priority)
-            st.success("Reminder added!")
+            final_subject = matched_subject
+            remind_at = final_dt - timedelta(minutes=int(remind_offset)) if final_dt else None
+            add_reminder(final_task, final_dt, category, priority, final_subject, remind_at)
+            if matched_label:
+                st.success(f"Reminder added for {matched_label}.")
+            else:
+                st.success("Reminder added!")
             st.rerun()
 
 
@@ -617,12 +442,15 @@ with tab2:
             done = "✅ " if int(r[5] or 0) else ""
             tag_class = "critical" if r[4] == "Critical" else "optional"
             due_text = r[2] if r[2] else "No due date"
+            subj = r[6] if len(r) > 6 and r[6] else "General"
+            remind_text = r[7] if len(r) > 7 and r[7] else "-"
 
             st.markdown(
                 f"""
                 <div class="reminder-card">
                     <strong>{done}{r[1]}</strong><br>
-                    <span style="color:#888;font-size:13px">📅 {due_text} &nbsp;·&nbsp; {r[3]}</span>
+                    <span style="color:#888;font-size:13px">📅 {due_text} &nbsp;·&nbsp; {r[3]} &nbsp;·&nbsp; 📘 {subj}</span><br>
+                    <span style="color:#666;font-size:12px">⏰ Remind at: {remind_text}</span>
                     &nbsp;<span class="tag {tag_class}">{icon} {r[4]}</span>
                 </div>
                 """,
@@ -637,19 +465,18 @@ with tab3:
         st.info("Nothing to manage yet.")
     else:
         for r in data:
-            rid, task, due_date, category, priority, done = r
+            rid, task_name, due_date, category, priority, done, subject, remind_at = r
             due_text = due_date if due_date else "No due date"
+            subject_text = subject if subject else "General"
+            remind_text = remind_at if remind_at else "-"
 
-            st.markdown(f"**{task}**  \n`{due_text}` · {category} · {priority}")
+            st.markdown(f"*{task_name}*  \n`{due_text}` · {category} · {priority} · {subject_text} · remind {remind_text}")
 
             col1, col2 = st.columns(2)
             with col1:
                 new_done = st.checkbox("Done", value=bool(done), key=f"done_{rid}")
                 if new_done != bool(done):
-                    cur.execute(
-                        "UPDATE reminders SET done=? WHERE id=?",
-                        (1 if new_done else 0, rid),
-                    )
+                    cur.execute("UPDATE reminders SET done=? WHERE id=?", (1 if new_done else 0, rid))
                     conn.commit()
                     st.rerun()
 
@@ -661,3 +488,4 @@ with tab3:
                     st.rerun()
 
             st.divider()
+
