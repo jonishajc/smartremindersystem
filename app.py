@@ -88,6 +88,8 @@ DAY_ALIASES = {
     "sunday": "Sunday",
 }
 
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 
 def normalize_day(day_text: str):
     if not day_text:
@@ -183,6 +185,61 @@ def parse_timetable_text(raw_text: str):
     return entries
 
 
+def parse_timetable_table(pdf_bytes: bytes):
+    if pdfplumber is None:
+        return []
+    entries = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables() or []
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+                header = [str(c or "").strip() for c in table[0]]
+                day_col_indices = []
+                for idx, col_name in enumerate(header):
+                    normalized = normalize_day(col_name)
+                    if normalized:
+                        day_col_indices.append((idx, normalized))
+                if not day_col_indices:
+                    continue
+
+                for row in table[1:]:
+                    cells = [str(c or "").strip() for c in row]
+                    if len(cells) < 2:
+                        continue
+                    period_or_time = cells[0]
+                    start_time = None
+                    end_time = ""
+
+                    # Accept strings like "09:00-10:00", "9-10", "8:30 to 9:20"
+                    tm = re.search(
+                        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to|–|—)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+                        period_or_time,
+                        flags=re.IGNORECASE,
+                    )
+                    if tm:
+                        start_time = parse_time_text(tm.group(1))
+                        end_time = parse_time_text(tm.group(2)) or ""
+
+                    for col_idx, day_name in day_col_indices:
+                        if col_idx >= len(cells):
+                            continue
+                        subject = re.sub(r"\s+", " ", cells[col_idx]).strip(" -|")
+                        if not subject or subject.lower() in {"break", "lunch", "free", "na", "n/a"}:
+                            continue
+                        entries.append(
+                            {
+                                "day": day_name,
+                                "subject": subject,
+                                "start_time": start_time or "",
+                                "end_time": end_time,
+                                "period": period_or_time,
+                            }
+                        )
+    return entries
+
+
 def next_weekday_datetime(day_name: str, time_str: str):
     weekday_map = {
         "Monday": 0,
@@ -217,6 +274,12 @@ def find_matching_slots(task_text: str, timetable_rows):
         if any(w in subject for w in words):
             matches.append(row)
     return matches
+
+
+def canonical_subject_label(text: str):
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 # -------------------- Database --------------------
@@ -307,6 +370,10 @@ st.caption("Timetable-aware reminders · NLP input · Predictive priority")
 
 if "timetable_rows" not in st.session_state:
     st.session_state.timetable_rows = []
+if "subject_aliases" not in st.session_state:
+    st.session_state.subject_aliases = {}
+if "period_time_map" not in st.session_state:
+    st.session_state.period_time_map = {}
 
 tab0, tab1, tab2, tab3 = st.tabs(["Timetable", "Add", "View", "Manage"])
 
@@ -321,23 +388,25 @@ with tab0:
 
     if up:
         raw_text, error = extract_text_from_upload(up)
+        table_rows = []
+        if up.name.lower().endswith(".pdf"):
+            table_rows = parse_timetable_table(up.getvalue())
         if error:
             st.warning(error)
-        if raw_text:
-            rows = parse_timetable_text(raw_text)
-            if rows:
-                st.success(f"Detected {len(rows)} timetable slot(s). Review and edit below.")
-                df = pd.DataFrame(rows)
-                edited = st.data_editor(
-                    df,
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    key="tt_editor",
-                )
-                st.session_state.timetable_rows = edited.fillna("").to_dict("records")
-            else:
-                st.info("Could not parse structured slots from text. Add rows manually below.")
-                st.text_area("Extracted text preview", value=raw_text[:3000], height=180)
+        rows = table_rows if table_rows else parse_timetable_text(raw_text)
+        if rows:
+            st.success(f"Detected {len(rows)} timetable slot(s). Review and edit below.")
+            df = pd.DataFrame(rows)
+            edited = st.data_editor(
+                df,
+                use_container_width=True,
+                num_rows="dynamic",
+                key="tt_editor",
+            )
+            st.session_state.timetable_rows = edited.fillna("").to_dict("records")
+        elif raw_text:
+            st.info("Could not parse structured slots from text. Add rows manually below.")
+            st.text_area("Extracted text preview", value=raw_text[:3000], height=180)
 
     if not st.session_state.timetable_rows:
         st.markdown("##### Add timetable rows manually")
@@ -379,8 +448,14 @@ with tab1:
     matched_slot_dt = None
     matched_subject = None
     matched_label = None
+    matched_period = None
 
-    possible_slots = find_matching_slots(text, st.session_state.timetable_rows)
+    normalized_text = canonical_subject_label(text)
+    for alias, canonical in st.session_state.subject_aliases.items():
+        if alias and alias in normalized_text:
+            normalized_text = normalized_text.replace(alias, canonical)
+
+    possible_slots = find_matching_slots(normalized_text, st.session_state.timetable_rows)
     if text and not auto_date and possible_slots:
         labels = [
             f"{r.get('subject', 'Unknown')} | {r.get('day', '')} {r.get('start_time', '')}"
@@ -392,12 +467,59 @@ with tab1:
         )
         chosen = possible_slots[labels.index(selected_label)]
         matched_subject = chosen.get("subject")
-        matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), chosen.get("start_time", ""))
+        matched_period = str(chosen.get("period", "")).strip()
+        start_time = str(chosen.get("start_time", "")).strip()
+        if not start_time and matched_period and matched_period in st.session_state.period_time_map:
+            start_time = st.session_state.period_time_map[matched_period]
+        matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), start_time)
         matched_label = selected_label
         if matched_slot_dt:
             st.success(f"Class slot selected: *{matched_slot_dt.strftime('%a %b %d, %Y - %H:%M')}*")
+        elif matched_period:
+            st.info(f"I found subject/day but no exact hour for `{matched_period}`. Set a period time below.")
     elif text and not auto_date and st.session_state.timetable_rows:
         st.info("No subject match found in timetable. Pick manual date/time below.")
+
+    if matched_period and not matched_slot_dt:
+        period_time = st.text_input(
+            f"Start time for `{matched_period}` (HH:MM or 6pm)",
+            key="period_time_input",
+            placeholder="e.g. 15:00",
+        )
+        if period_time:
+            parsed_period_time = parse_time_text(period_time)
+            if parsed_period_time:
+                st.session_state.period_time_map[matched_period] = parsed_period_time
+                st.success(f"Saved: {matched_period} starts at {parsed_period_time}")
+                st.rerun()
+            else:
+                st.warning("Could not parse that time. Try HH:MM or AM/PM format.")
+
+    if st.session_state.timetable_rows and not possible_slots:
+        st.markdown("##### Help me learn this subject name")
+        alias_col1, alias_col2 = st.columns(2)
+        with alias_col1:
+            alias_input = st.text_input("You wrote", value=canonical_subject_label(text), key="alias_input")
+        with alias_col2:
+            subject_options = sorted(
+                list(
+                    {
+                        str(r.get("subject", "")).strip()
+                        for r in st.session_state.timetable_rows
+                        if str(r.get("subject", "")).strip()
+                    }
+                )
+            )
+            canonical_choice = st.selectbox(
+                "Map it to timetable subject",
+                subject_options if subject_options else ["Python"],
+                key="alias_target",
+            )
+        if st.button("Save subject mapping", use_container_width=True):
+            if alias_input.strip() and canonical_choice.strip():
+                st.session_state.subject_aliases[canonical_subject_label(alias_input)] = canonical_choice
+                st.success(f"Learned mapping: {alias_input} -> {canonical_choice}")
+                st.rerun()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -498,5 +620,4 @@ with tab3:
                     st.rerun()
 
             st.divider()
-
 
