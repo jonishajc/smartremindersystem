@@ -1,4 +1,5 @@
 streamlit
 scikit-learn
-python-dateutil
 dateparser
+python-dateutil
+anthropic  # or just use the built-in urllib as the code does — no extra package needed
