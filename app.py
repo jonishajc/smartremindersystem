@@ -1,55 +1,17 @@
-import io
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import dateparser
 from dateparser.search import search_dates
-import pandas as pd
 import streamlit as st
 from sklearn.tree import DecisionTreeClassifier
 
-try:
-    import pdfplumber
-except Exception:  # pragma: no cover
-    pdfplumber = None
-
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover
-    Image = None
-
-try:
-    import pytesseract
-except Exception:  # pragma: no cover
-    pytesseract = None
-
 
 # -------------------- ML priority model --------------------
-CATEGORIES = {
-    "academics": 0,
-    "work": 1,
-    "personal": 2,
-    "entertainment": 3,
-    "shopping": 4,
-    "other": 5,
-}
-X = [
-    [2, 0], [8, 0], [24, 0],       # academics
-    [2, 1], [10, 1], [48, 1],      # work
-    [1, 2], [6, 2], [72, 2],       # personal
-    [1, 3], [12, 3], [80, 3],      # entertainment
-    [2, 4], [24, 4], [96, 4],      # shopping
-    [4, 5], [30, 5], [120, 5],     # other
-]
-y = [
-    1, 1, 0,
-    1, 1, 0,
-    1, 1, 0,
-    1, 0, 0,
-    1, 0, 0,
-    1, 0, 0,
-]
+CATEGORIES = {"assignment": 0, "work": 1, "event": 2, "other": 3}
+X = [[2, 0], [6, 0], [12, 0], [48, 1], [72, 1], [2, 2], [80, 2], [3, 3], [100, 3]]
+y = [1, 1, 1, 0, 0, 1, 0, 1, 0]
 
 clf = DecisionTreeClassifier(max_depth=3)
 clf.fit(X, y)
@@ -59,34 +21,8 @@ def predict_priority(due_date, category):
     if not due_date:
         return "Optional"
     hours = (due_date - datetime.now()).total_seconds() / 3600
-    cat_id = CATEGORIES.get(category, CATEGORIES["other"])
+    cat_id = CATEGORIES.get(category, 3)
     return "Critical" if clf.predict([[hours, cat_id]])[0] == 1 else "Optional"
-
-
-def has_explicit_time(text: str):
-    if not text:
-        return False
-    return bool(
-        re.search(
-            r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b|\bnoon\b|\bmidnight\b",
-            text.lower(),
-        )
-    )
-
-
-def infer_category(task_text: str, matched_subject: str = ""):
-    text = f"{task_text or ''} {matched_subject or ''}".lower()
-    rules = {
-        "academics": ["assignment", "homework", "exam", "class", "lecture", "study", "lab", "de", "python"],
-        "work": ["meeting", "office", "client", "project", "deadline", "report", "call"],
-        "shopping": ["buy", "purchase", "order", "grocery", "shop", "milk", "medicine"],
-        "entertainment": ["movie", "game", "netflix", "series", "concert", "party"],
-        "personal": ["gym", "doctor", "family", "friend", "birthday", "bank", "bill"],
-    }
-    for category, keys in rules.items():
-        if any(k in text for k in keys):
-            return category
-    return "other"
 
 
 # -------------------- Date extraction --------------------
@@ -107,237 +43,13 @@ def extract_reminder(text: str):
         due = dateparser.parse(text, settings=settings)
         return text, due
 
+    # Use the longest matched date phrase
     date_text, due = max(found, key=lambda x: len(x[0]))
     task = re.sub(re.escape(date_text), "", text, flags=re.IGNORECASE).strip(" ,.-")
     if not task:
         task = text
 
     return task, due
-
-
-# -------------------- Timetable parsing helpers --------------------
-DAY_ALIASES = {
-    "mon": "Monday",
-    "monday": "Monday",
-    "tue": "Tuesday",
-    "tues": "Tuesday",
-    "tuesday": "Tuesday",
-    "wed": "Wednesday",
-    "wednesday": "Wednesday",
-    "thu": "Thursday",
-    "thurs": "Thursday",
-    "thursday": "Thursday",
-    "fri": "Friday",
-    "friday": "Friday",
-    "sat": "Saturday",
-    "saturday": "Saturday",
-    "sun": "Sunday",
-    "sunday": "Sunday",
-}
-
-WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
-
-def normalize_day(day_text: str):
-    if not day_text:
-        return None
-    key = day_text.strip().lower()
-    return DAY_ALIASES.get(key)
-
-
-def parse_time_text(time_text: str):
-    if not time_text:
-        return None
-    cleaned = time_text.strip().lower().replace(".", ":")
-    if re.fullmatch(r"\d{1,2}", cleaned):
-        cleaned += ":00"
-    parsed = dateparser.parse(cleaned)
-    if not parsed:
-        return None
-    return parsed.strftime("%H:%M")
-
-
-def extract_text_from_upload(uploaded_file):
-    name = uploaded_file.name.lower()
-    data = uploaded_file.getvalue()
-
-    if name.endswith(".pdf"):
-        if pdfplumber is None:
-            return "", "Install pdfplumber to parse PDF timetables."
-        text_parts = []
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for page in pdf.pages:
-                text_parts.append(page.extract_text() or "")
-        return "\n".join(text_parts).strip(), None
-
-    if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        if Image is None or pytesseract is None:
-            return "", "Install pillow and pytesseract for image OCR, or upload PDF/text."
-        try:
-            image = Image.open(io.BytesIO(data))
-            # Light preprocessing improves OCR quality for timetable photos.
-            image = image.convert("L")
-            text = pytesseract.image_to_string(image)
-            if not (text or "").strip():
-                return "", "No readable text found in image. Try a higher-contrast image or use PDF."
-            return text.strip(), None
-        except Exception as e:
-            error_text = str(e).lower()
-            if "tesseract is not installed" in error_text or "tesseractnotfounderror" in error_text:
-                return "", (
-                    "Image OCR is unavailable on this deployment because the Tesseract engine is missing. "
-                    "Use PDF/TXT upload, or install Tesseract system package on the host."
-                )
-            return "", "Image OCR failed. Upload a clearer image/PDF or edit schedule manually."
-
-    if name.endswith(".txt"):
-        return data.decode("utf-8", errors="ignore"), None
-
-    return "", "Unsupported file type. Use PDF, image, or TXT."
-
-
-def parse_timetable_text(raw_text: str):
-    lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
-    entries = []
-    if not lines:
-        return entries
-
-    pattern = re.compile(
-        r"(?P<day>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
-        r"[\s,:-]+(?P<subject>[A-Za-z][A-Za-z0-9 &/\-]{1,40})"
-        r"[\s,:-]+(?P<start>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)"
-        r"\s*(?:-|to|–|—)\s*"
-        r"(?P<end>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
-        flags=re.IGNORECASE,
-    )
-
-    for line in lines:
-        match = pattern.search(line)
-        if not match:
-            continue
-        day = normalize_day(match.group("day"))
-        subject = match.group("subject").strip()
-        start_time = parse_time_text(match.group("start"))
-        end_time = parse_time_text(match.group("end"))
-        if day and subject and start_time:
-            entries.append(
-                {
-                    "day": day,
-                    "subject": subject,
-                    "start_time": start_time,
-                    "end_time": end_time or "",
-                }
-            )
-
-    return entries
-
-
-def parse_timetable_table(pdf_bytes: bytes):
-    if pdfplumber is None:
-        return []
-    entries = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables() or []
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
-                header = [str(c or "").strip() for c in table[0]]
-                day_col_indices = []
-                for idx, col_name in enumerate(header):
-                    normalized = normalize_day(col_name)
-                    if normalized:
-                        day_col_indices.append((idx, normalized))
-                if not day_col_indices:
-                    continue
-
-                for row in table[1:]:
-                    cells = [str(c or "").strip() for c in row]
-                    if len(cells) < 2:
-                        continue
-                    period_or_time = cells[0]
-                    start_time = None
-                    end_time = ""
-
-                    # Accept strings like "09:00-10:00", "9-10", "8:30 to 9:20"
-                    tm = re.search(
-                        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to|–|—)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
-                        period_or_time,
-                        flags=re.IGNORECASE,
-                    )
-                    if tm:
-                        start_time = parse_time_text(tm.group(1))
-                        end_time = parse_time_text(tm.group(2)) or ""
-
-                    for col_idx, day_name in day_col_indices:
-                        if col_idx >= len(cells):
-                            continue
-                        subject = re.sub(r"\s+", " ", cells[col_idx]).strip(" -|")
-                        if not subject or subject.lower() in {"break", "lunch", "free", "na", "n/a"}:
-                            continue
-                        entries.append(
-                            {
-                                "day": day_name,
-                                "subject": subject,
-                                "start_time": start_time or "",
-                                "end_time": end_time,
-                                "period": period_or_time,
-                            }
-                        )
-    return entries
-
-
-def next_weekday_datetime(day_name: str, time_str: str):
-    weekday_map = {
-        "Monday": 0,
-        "Tuesday": 1,
-        "Wednesday": 2,
-        "Thursday": 3,
-        "Friday": 4,
-        "Saturday": 5,
-        "Sunday": 6,
-    }
-    if day_name not in weekday_map or not time_str:
-        return None
-
-    now = datetime.now()
-    target_weekday = weekday_map[day_name]
-    hh, mm = [int(x) for x in time_str.split(":")]
-    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    delta_days = (target_weekday - now.weekday()) % 7
-    candidate = candidate + timedelta(days=delta_days)
-    if candidate <= now:
-        candidate += timedelta(days=7)
-    return candidate
-
-
-def find_matching_slots(task_text: str, timetable_rows):
-    words = re.findall(r"[a-zA-Z]{3,}", (task_text or "").lower())
-    if not words:
-        return []
-    matches = []
-    for row in timetable_rows:
-        subject = str(row.get("subject", "")).lower()
-        if any(w in subject for w in words):
-            matches.append(row)
-    return matches
-
-
-def canonical_subject_label(text: str):
-    cleaned = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
-
-
-def slot_datetime_for_target(base_date: datetime, slot_day: str, start_time: str):
-    if not base_date or not slot_day or not start_time:
-        return None
-    if slot_day not in WEEKDAYS:
-        return None
-    if base_date.strftime("%A") != slot_day:
-        return None
-    hh, mm = [int(x) for x in start_time.split(":")]
-    return base_date.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
 # -------------------- Database --------------------
@@ -352,31 +64,25 @@ cur.execute(
         due_date TEXT,
         category TEXT,
         priority TEXT,
-        done INTEGER DEFAULT 0,
-        subject TEXT,
-        remind_at TEXT
+        done INTEGER DEFAULT 0
     )
 """
 )
 conn.commit()
 
+# Migration safety for old DB schema
 cur.execute("PRAGMA table_info(reminders)")
 cols = {row[1] for row in cur.fetchall()}
 if "done" not in cols:
     cur.execute("ALTER TABLE reminders ADD COLUMN done INTEGER DEFAULT 0")
-if "subject" not in cols:
-    cur.execute("ALTER TABLE reminders ADD COLUMN subject TEXT")
-if "remind_at" not in cols:
-    cur.execute("ALTER TABLE reminders ADD COLUMN remind_at TEXT")
-conn.commit()
+    conn.commit()
 
 
-def add_reminder(task, due_date, category, priority, subject=None, remind_at=None):
+def add_reminder(task, due_date, category, priority):
     due_str = due_date.strftime("%Y-%m-%d %H:%M") if due_date else None
-    remind_str = remind_at.strftime("%Y-%m-%d %H:%M") if remind_at else None
     cur.execute(
-        "INSERT INTO reminders (task,due_date,category,priority,subject,remind_at) VALUES (?,?,?,?,?,?)",
-        (task, due_str, category, priority, subject, remind_str),
+        "INSERT INTO reminders (task,due_date,category,priority) VALUES (?,?,?,?)",
+        (task, due_str, category, priority),
     )
     conn.commit()
 
@@ -399,7 +105,7 @@ st.set_page_config(page_title="Smart Reminders", page_icon="🗓️", layout="ce
 st.markdown(
     """
 <style>
-    .block-container { max-width: 900px; padding-top: 2rem; }
+    .block-container { max-width: 720px; padding-top: 2rem; }
     h1 { font-weight: 500; letter-spacing: -0.5px; }
     .reminder-card {
         background: #f9f9f7;
@@ -424,75 +130,17 @@ st.markdown(
 )
 
 st.title("🗓️ Smart Reminder System")
-st.caption("Timetable-aware reminders · NLP input · Predictive priority")
+st.caption("AI-powered · NLP input · Predictive priority")
 
-if "timetable_rows" not in st.session_state:
-    st.session_state.timetable_rows = []
-if "subject_aliases" not in st.session_state:
-    st.session_state.subject_aliases = {}
-if "period_time_map" not in st.session_state:
-    st.session_state.period_time_map = {}
-
-tab0, tab1, tab2, tab3 = st.tabs(["Add", "Timetable", "View", "Manage"])
+tab1, tab2, tab3 = st.tabs(["Add", "View", "Manage"])
 
 
-# -------------------- Tab 1: Timetable --------------------
+# -------------------- Tab 1: Add --------------------
 with tab1:
-    st.markdown("#### Upload timetable")
-    up = st.file_uploader(
-        "Upload PDF/Image/TXT timetable",
-        type=["pdf", "png", "jpg", "jpeg", "webp", "txt"],
-    )
-
-    if up:
-        raw_text, error = extract_text_from_upload(up)
-        table_rows = []
-        if up.name.lower().endswith(".pdf"):
-            table_rows = parse_timetable_table(up.getvalue())
-        if error:
-            st.warning(error)
-        rows = table_rows if table_rows else parse_timetable_text(raw_text)
-        if rows:
-            st.success(f"Detected {len(rows)} timetable slot(s). Review and edit below.")
-            df = pd.DataFrame(rows)
-            edited = st.data_editor(
-                df,
-                use_container_width=True,
-                num_rows="dynamic",
-                key="tt_editor",
-            )
-            st.session_state.timetable_rows = edited.fillna("").to_dict("records")
-        elif raw_text:
-            st.info("Could not parse structured slots from text. Add rows manually below.")
-            st.text_area("Extracted text preview", value=raw_text[:3000], height=180)
-
-    if not st.session_state.timetable_rows:
-        st.markdown("##### Add timetable rows manually")
-        empty_df = pd.DataFrame(
-            [
-                {"day": "Monday", "subject": "Python", "start_time": "15:00", "end_time": "16:00"},
-            ]
-        )
-        manual_df = st.data_editor(
-            empty_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            key="tt_manual_editor",
-        )
-        if st.button("Save timetable rows", use_container_width=True):
-            st.session_state.timetable_rows = manual_df.fillna("").to_dict("records")
-            st.success("Timetable saved.")
-            st.rerun()
-    else:
-        st.caption(f"Active timetable rows: {len(st.session_state.timetable_rows)}")
-
-
-# -------------------- Tab 0: Add --------------------
-with tab0:
     st.markdown("#### New reminder")
     text = st.text_input(
         "Describe your task",
-        placeholder="e.g. python homework, submit by friday 5pm",
+        placeholder="e.g. submit lab report by friday 5pm",
     )
 
     task, auto_date = "", None
@@ -501,93 +149,7 @@ with tab0:
         if auto_date:
             st.success(f"Detected date: *{auto_date.strftime('%b %d, %Y - %H:%M')}*")
         else:
-            st.info("No clear date in text. I'll try matching subject from your timetable.")
-
-    matched_slot_dt = None
-    matched_subject = None
-    matched_label = None
-    matched_period = None
-    chosen = None
-
-    normalized_text = canonical_subject_label(text)
-    for alias, canonical in st.session_state.subject_aliases.items():
-        if alias and alias in normalized_text:
-            normalized_text = normalized_text.replace(alias, canonical)
-
-    possible_slots = find_matching_slots(normalized_text, st.session_state.timetable_rows)
-    if auto_date and possible_slots:
-        weekday_name = auto_date.strftime("%A")
-        weekday_slots = [s for s in possible_slots if str(s.get("day", "")).strip() == weekday_name]
-        if weekday_slots:
-            possible_slots = weekday_slots
-
-    if text and possible_slots:
-        labels = [
-            f"{r.get('subject', 'Unknown')} | {r.get('day', '')} {r.get('start_time', '')}"
-            for r in possible_slots
-        ]
-        selected_label = st.selectbox(
-            "I found matching class timings. Pick one:",
-            labels,
-        )
-        chosen = possible_slots[labels.index(selected_label)]
-        matched_subject = chosen.get("subject")
-        matched_period = str(chosen.get("period", "")).strip()
-        start_time = str(chosen.get("start_time", "")).strip()
-        if not start_time and matched_period and matched_period in st.session_state.period_time_map:
-            start_time = st.session_state.period_time_map[matched_period]
-        if auto_date and not has_explicit_time(text):
-            matched_slot_dt = slot_datetime_for_target(auto_date, chosen.get("day", ""), start_time)
-        if not matched_slot_dt:
-            matched_slot_dt = next_weekday_datetime(chosen.get("day", ""), start_time)
-        matched_label = selected_label
-        if matched_slot_dt:
-            st.success(f"Class slot selected: *{matched_slot_dt.strftime('%a %b %d, %Y - %H:%M')}*")
-        elif matched_period:
-            st.info(f"I found subject/day but no exact hour for `{matched_period}`. Set a period time below.")
-    elif text and st.session_state.timetable_rows:
-        st.info("No subject match found in timetable. Pick manual date/time below.")
-
-    if matched_period and not matched_slot_dt:
-        period_time = st.text_input(
-            f"Start time for `{matched_period}` (HH:MM or 6pm)",
-            key="period_time_input",
-            placeholder="e.g. 15:00",
-        )
-        if period_time:
-            parsed_period_time = parse_time_text(period_time)
-            if parsed_period_time:
-                st.session_state.period_time_map[matched_period] = parsed_period_time
-                st.success(f"Saved: {matched_period} starts at {parsed_period_time}")
-                st.rerun()
-            else:
-                st.warning("Could not parse that time. Try HH:MM or AM/PM format.")
-
-    if st.session_state.timetable_rows and not possible_slots:
-        st.markdown("##### Help me learn this subject name")
-        alias_col1, alias_col2 = st.columns(2)
-        with alias_col1:
-            alias_input = st.text_input("You wrote", value=canonical_subject_label(text), key="alias_input")
-        with alias_col2:
-            subject_options = sorted(
-                list(
-                    {
-                        str(r.get("subject", "")).strip()
-                        for r in st.session_state.timetable_rows
-                        if str(r.get("subject", "")).strip()
-                    }
-                )
-            )
-            canonical_choice = st.selectbox(
-                "Map it to timetable subject",
-                subject_options if subject_options else ["Python"],
-                key="alias_target",
-            )
-        if st.button("Save subject mapping", use_container_width=True):
-            if alias_input.strip() and canonical_choice.strip():
-                st.session_state.subject_aliases[canonical_subject_label(alias_input)] = canonical_choice
-                st.success(f"Learned mapping: {alias_input} -> {canonical_choice}")
-                st.rerun()
+            st.info("No date detected in text - pick one below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -597,28 +159,14 @@ with tab0:
             value=datetime.now().replace(second=0, microsecond=0).time(),
         )
     with col2:
-        suggested_category = infer_category(task if task else text, matched_subject or "")
-        category_options = ["academics", "work", "personal", "entertainment", "shopping", "other"]
-        category = st.selectbox(
-            "Category",
-            category_options,
-            index=category_options.index(suggested_category),
-            help=f"AI suggested: {suggested_category}",
-        )
+        category = st.selectbox("Category", ["assignment", "work", "event", "other"])
         priority_mode = st.radio("Priority", ["AI decides", "I'll choose"])
-
-    remind_offset = st.selectbox(
-        "Remind me before class/task by",
-        [0, 5, 10, 15, 20, 30, 45, 60],
-        index=4,
-        format_func=lambda x: "At exact time" if x == 0 else f"{x} minutes",
-    )
 
     if priority_mode == "I'll choose":
         priority = st.selectbox("Set priority", ["Critical", "Optional"])
     else:
-        chosen_dt = matched_slot_dt or auto_date or datetime.combine(manual_date, manual_time)
-        priority = predict_priority(chosen_dt, category)
+        final_dt = auto_date if auto_date else datetime.combine(manual_date, manual_time)
+        priority = predict_priority(final_dt, category)
         badge = "🔴 Critical" if priority == "Critical" else "🟢 Optional"
         st.markdown(f"AI priority: *{badge}*")
 
@@ -626,15 +174,10 @@ with tab0:
         if not text.strip():
             st.warning("Please enter a task.")
         else:
-            final_dt = matched_slot_dt or auto_date or datetime.combine(manual_date, manual_time)
+            final_dt = auto_date if auto_date else datetime.combine(manual_date, manual_time)
             final_task = task if task else text
-            final_subject = matched_subject or (chosen.get("subject") if chosen else None)
-            remind_at = final_dt - timedelta(minutes=int(remind_offset)) if final_dt else None
-            add_reminder(final_task, final_dt, category, priority, final_subject, remind_at)
-            if matched_label:
-                st.success(f"Reminder added for {matched_label}.")
-            else:
-                st.success("Reminder added!")
+            add_reminder(final_task, final_dt, category, priority)
+            st.success("Reminder added!")
             st.rerun()
 
 
@@ -649,15 +192,12 @@ with tab2:
             done = "✅ " if int(r[5] or 0) else ""
             tag_class = "critical" if r[4] == "Critical" else "optional"
             due_text = r[2] if r[2] else "No due date"
-            subj = r[6] if len(r) > 6 and r[6] else "General"
-            remind_text = r[7] if len(r) > 7 and r[7] else "-"
 
             st.markdown(
                 f"""
                 <div class="reminder-card">
                     <strong>{done}{r[1]}</strong><br>
-                    <span style="color:#888;font-size:13px">📅 {due_text} &nbsp;·&nbsp; {r[3]} &nbsp;·&nbsp; 📘 {subj}</span><br>
-                    <span style="color:#666;font-size:12px">⏰ Remind at: {remind_text}</span>
+                    <span style="color:#888;font-size:13px">📅 {due_text} &nbsp;·&nbsp; {r[3]}</span>
                     &nbsp;<span class="tag {tag_class}">{icon} {r[4]}</span>
                 </div>
                 """,
@@ -672,18 +212,19 @@ with tab3:
         st.info("Nothing to manage yet.")
     else:
         for r in data:
-            rid, task_name, due_date, category, priority, done, subject, remind_at = r
+            rid, task, due_date, category, priority, done = r
             due_text = due_date if due_date else "No due date"
-            subject_text = subject if subject else "General"
-            remind_text = remind_at if remind_at else "-"
 
-            st.markdown(f"*{task_name}*  \n`{due_text}` · {category} · {priority} · {subject_text} · remind {remind_text}")
+            st.markdown(f"*{task}*  \n`{due_text}` · {category} · {priority}")
 
             col1, col2 = st.columns(2)
             with col1:
                 new_done = st.checkbox("Done", value=bool(done), key=f"done_{rid}")
                 if new_done != bool(done):
-                    cur.execute("UPDATE reminders SET done=? WHERE id=?", (1 if new_done else 0, rid))
+                    cur.execute(
+                        "UPDATE reminders SET done=? WHERE id=?",
+                        (1 if new_done else 0, rid),
+                    )
                     conn.commit()
                     st.rerun()
 
@@ -695,5 +236,4 @@ with tab3:
                     st.rerun()
 
             st.divider()
-
 
