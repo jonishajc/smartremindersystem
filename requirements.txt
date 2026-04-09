@@ -165,11 +165,14 @@ def extract_text_from_upload(uploaded_file):
     if name.endswith(".pdf"):
         if pdfplumber is None:
             return "", "Install pdfplumber to parse PDF timetables."
-        text_parts = []
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for page in pdf.pages:
-                text_parts.append(page.extract_text() or "")
-        return "\n".join(text_parts).strip(), None
+        try:
+            text_parts = []
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    text_parts.append(page.extract_text() or "")
+            return "\n".join(text_parts).strip(), None
+        except Exception as e:
+            return "", f"PDF read failed: {e}"
 
     if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
         if Image is None or pytesseract is None:
@@ -237,54 +240,57 @@ def parse_timetable_table(pdf_bytes: bytes):
     if pdfplumber is None:
         return []
     entries = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables() or []
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
-                header = [str(c or "").strip() for c in table[0]]
-                day_col_indices = []
-                for idx, col_name in enumerate(header):
-                    normalized = normalize_day(col_name)
-                    if normalized:
-                        day_col_indices.append((idx, normalized))
-                if not day_col_indices:
-                    continue
-
-                for row in table[1:]:
-                    cells = [str(c or "").strip() for c in row]
-                    if len(cells) < 2:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    if not table or len(table) < 2:
                         continue
-                    period_or_time = cells[0]
-                    start_time = None
-                    end_time = ""
+                    header = [str(c or "").strip() for c in table[0]]
+                    day_col_indices = []
+                    for idx, col_name in enumerate(header):
+                        normalized = normalize_day(col_name)
+                        if normalized:
+                            day_col_indices.append((idx, normalized))
+                    if not day_col_indices:
+                        continue
 
-                    # Accept strings like "09:00-10:00", "9-10", "8:30 to 9:20"
-                    tm = re.search(
-                        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to|–|—)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
-                        period_or_time,
-                        flags=re.IGNORECASE,
-                    )
-                    if tm:
-                        start_time = parse_time_text(tm.group(1))
-                        end_time = parse_time_text(tm.group(2)) or ""
+                    for row in table[1:]:
+                        cells = [str(c or "").strip() for c in row]
+                        if len(cells) < 2:
+                            continue
+                        period_or_time = cells[0]
+                        start_time = None
+                        end_time = ""
 
-                    for col_idx, day_name in day_col_indices:
-                        if col_idx >= len(cells):
-                            continue
-                        subject = re.sub(r"\s+", " ", cells[col_idx]).strip(" -|")
-                        if not subject or subject.lower() in {"break", "lunch", "free", "na", "n/a"}:
-                            continue
-                        entries.append(
-                            {
-                                "day": day_name,
-                                "subject": subject,
-                                "start_time": start_time or "",
-                                "end_time": end_time,
-                                "period": period_or_time,
-                            }
+                        # Accept strings like "09:00-10:00", "9-10", "8:30 to 9:20"
+                        tm = re.search(
+                            r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to|–|—)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+                            period_or_time,
+                            flags=re.IGNORECASE,
                         )
+                        if tm:
+                            start_time = parse_time_text(tm.group(1))
+                            end_time = parse_time_text(tm.group(2)) or ""
+
+                        for col_idx, day_name in day_col_indices:
+                            if col_idx >= len(cells):
+                                continue
+                            subject = re.sub(r"\s+", " ", cells[col_idx]).strip(" -|")
+                            if not subject or subject.lower() in {"break", "lunch", "free", "na", "n/a"}:
+                                continue
+                            entries.append(
+                                {
+                                    "day": day_name,
+                                    "subject": subject,
+                                    "start_time": start_time or "",
+                                    "end_time": end_time,
+                                    "period": period_or_time,
+                                }
+                            )
+    except Exception:
+        return []
     return entries
 
 
@@ -622,6 +628,35 @@ with tab0:
         format_func=lambda x: "At exact time" if x == 0 else f"{x} minutes",
     )
 
+    if priority_mode == "I'll choose":
+        priority = st.selectbox("Set priority", ["Critical", "Optional"])
+    else:
+        final_dt_preview = None
+        unresolved_time = False
+        if matched_slot_dt:
+            final_dt_preview = matched_slot_dt
+        elif auto_date and explicit_time_in_text:
+            final_dt_preview = auto_date
+        elif auto_date and not explicit_time_in_text:
+            # Date is known but time is missing: never silently use parser's guessed clock time.
+            final_dt_preview = datetime.combine(auto_date.date(), manual_time)
+            unresolved_time = True
+            st.warning(
+                "I detected a date but no exact class time from timetable. "
+                "Pick a manual time (left panel) or map the subject/period first."
+            )
+        else:
+            final_dt_preview = datetime.combine(manual_date, manual_time)
+
+        if final_dt_preview:
+            st.caption(f"Reminder base time: {final_dt_preview.strftime('%a %b %d, %Y - %H:%M')}")
+
+        chosen_dt = final_dt_preview
+        priority = predict_priority(chosen_dt, category)
+        badge = "🔴 Critical" if priority == "Critical" else "🟢 Optional"
+        st.markdown(f"AI priority: *{badge}*")
+
+    # Keep final preview available for submit path when user chooses manual priority mode.
     final_dt_preview = None
     unresolved_time = False
     if matched_slot_dt:
@@ -629,26 +664,10 @@ with tab0:
     elif auto_date and explicit_time_in_text:
         final_dt_preview = auto_date
     elif auto_date and not explicit_time_in_text:
-        # Date is known but time is missing: never silently use parser's guessed clock time.
         final_dt_preview = datetime.combine(auto_date.date(), manual_time)
         unresolved_time = True
-        st.warning(
-            "I detected a date but no exact class time from timetable. "
-            "Pick a manual time (left panel) or map the subject/period first."
-        )
     else:
         final_dt_preview = datetime.combine(manual_date, manual_time)
-
-    if final_dt_preview:
-        st.caption(f"Reminder base time: {final_dt_preview.strftime('%a %b %d, %Y - %H:%M')}")
-
-    if priority_mode == "I'll choose":
-        priority = st.selectbox("Set priority", ["Critical", "Optional"])
-    else:
-        chosen_dt = final_dt_preview
-        priority = predict_priority(chosen_dt, category)
-        badge = "🔴 Critical" if priority == "Critical" else "🟢 Optional"
-        st.markdown(f"AI priority: *{badge}*")
 
     confirm_unresolved = True
     if unresolved_time:
